@@ -1211,8 +1211,8 @@ async def init_guinea_sample_data():
         if db.query(Restaurant).count() == 0:
             restaurants = [
                 Restaurant(
-                    name="Chez Fatou",
-                    phone_number="224611223344",
+                    name="Chez Mizo",
+                    phone_number="33755347855",
                     address="Kipé, près du rond-point",
                     zone="Kipé",
                     latitude=9.5900,
@@ -1246,7 +1246,7 @@ async def init_guinea_sample_data():
                 db.add(restaurant)
             db.commit()
             
-            rest_fatou = db.query(Restaurant).filter(Restaurant.name == "Chez Fatou").first()
+            rest_fatou = db.query(Restaurant).filter(Restaurant.name == "Chez Mizo").first()
             if rest_fatou:
                 products_fatou = [
                     Product(restaurant_id=rest_fatou.id, name="Riz sauce arachide", description="Riz blanc avec sauce aux arachides", price=15000, category="Plat principal"),
@@ -1277,8 +1277,8 @@ async def init_guinea_sample_data():
         if db.query(DeliveryDriver).count() == 0:
             drivers = [
                 DeliveryDriver(
-                    name="Mamadou Diallo",
-                    phone_number="224677889900",
+                    name="Tokoss Bah",
+                    phone_number="33763524511",
                     zone="Kipé",
                     current_latitude=9.5900,
                     current_longitude=-13.6100
