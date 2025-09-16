@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, Text, ForeignKey, Boolean
@@ -1155,14 +1155,14 @@ async def health_check(db: Session = Depends(get_db)):
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
-
+from fastapi.responses import PlainTextResponse 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     verify_token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
     
     if verify_token == config.WHATSAPP_VERIFY_TOKEN:
-        return int(challenge)
+        return PlainTextResponse(content=challenge)
     
     raise HTTPException(status_code=403, detail="Invalid verification token")
 
