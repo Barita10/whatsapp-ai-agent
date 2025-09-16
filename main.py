@@ -1,4 +1,4 @@
-# main.py - Version Interactive avec Boutons WhatsApp
+# main.py - Version Interactive Complète avec Toutes les Zones
 # Système de commande restaurant sans saisie de texte
 # Utilise les boutons et listes interactives WhatsApp Business API
 
@@ -30,14 +30,14 @@ class Config:
     WHATSAPP_VERIFY_TOKEN: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "Aminat041197")
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./conakry_food.db")
     
-    ADMIN_PHONE: str = os.getenv("ADMIN_PHONE", "224611223344")
+    ADMIN_PHONE: str = os.getenv("ADMIN_PHONE", "33758262447")
     BASE_DELIVERY_FEE: int = int(os.getenv("BASE_DELIVERY_FEE", "2000"))
     FEE_PER_KM: int = int(os.getenv("FEE_PER_KM", "500"))
 
 config = Config()
 
 # -----------------------------------------------------------------------------
-# DB Models (inchangés)
+# DB Models
 # -----------------------------------------------------------------------------
 engine = create_engine(config.DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -58,9 +58,6 @@ class PaymentStatus:
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
-
-# Zones de Conakry principales pour les boutons
-MAIN_ZONES = ["Kipé", "Kaloum", "Ratoma", "Matam", "Matoto", "Dixinn"]
 
 class Restaurant(Base):
     __tablename__ = "restaurants"
@@ -207,7 +204,7 @@ class WhatsAppService:
                 "type": "button",
                 "body": {"text": body},
                 "action": {
-                    "buttons": buttons[:3]  # Max 3 boutons
+                    "buttons": buttons[:3]
                 }
             }
         }
@@ -299,15 +296,8 @@ class InteractiveConversationService:
         context = self.get_conversation_context(phone)
         logging.info(f"🔘 Button clicked: {button_id} - {button_text} from {phone}")
         
-        # Sélection de zone
-        if button_id.startswith("zone_"):
-            zone = button_id.replace("zone_", "")
-            context["selected_zone"] = zone
-            self.send_restaurant_list(phone, zone)
-            context["state"] = "restaurant_selection"
-        
         # Actions sur le panier
-        elif button_id == "add_more":
+        if button_id == "add_more":
             restaurant_id = context.get("selected_restaurant", {}).get("id")
             if restaurant_id:
                 self.send_product_list(phone, restaurant_id)
@@ -340,8 +330,15 @@ class InteractiveConversationService:
         context = self.get_conversation_context(phone)
         logging.info(f"📋 List item selected: {item_id} from {phone}")
         
+        # Sélection de zone depuis la liste
+        if item_id.startswith("zone_"):
+            zone = item_id.replace("zone_", "")
+            context["selected_zone"] = zone
+            self.send_restaurant_list(phone, zone)
+            context["state"] = "restaurant_selection"
+        
         # Sélection de restaurant
-        if item_id.startswith("rest_"):
+        elif item_id.startswith("rest_"):
             restaurant_id = int(item_id.replace("rest_", ""))
             restaurant = self.db.query(Restaurant).filter(Restaurant.id == restaurant_id).first()
             if restaurant:
@@ -349,6 +346,7 @@ class InteractiveConversationService:
                     "id": restaurant.id,
                     "name": restaurant.name
                 }
+                logging.info(f"🍽️ Restaurant selected: {restaurant.name} (ID: {restaurant.id})")
                 self.send_product_list(phone, restaurant_id)
                 context["state"] = "product_selection"
         
@@ -391,20 +389,27 @@ class InteractiveConversationService:
         self.update_conversation_context(phone, context)
 
     def send_welcome_with_zones(self, phone: str):
-        """Envoie le message de bienvenue avec boutons de zones"""
-        body = "🍽️ Bienvenue sur Conakry Food!\n\nSélectionnez votre zone:"
+        """Envoie le message de bienvenue avec TOUTES les zones en liste"""
+        body = "🍽️ Bienvenue sur Conakry Food!\n\nChoisissez votre zone de livraison:"
         
-        buttons = []
-        for zone in MAIN_ZONES[:3]:  # Max 3 boutons
-            buttons.append({
-                "type": "reply",
-                "reply": {
-                    "id": f"zone_{zone}",
-                    "title": zone
-                }
+        # Utiliser une liste pour afficher toutes les zones
+        sections = [{
+            "title": "Zones de livraison",
+            "rows": []
+        }]
+        
+        # Toutes les zones de Conakry
+        all_zones = ["Kipé", "Kaloum", "Ratoma", "Matam", "Matoto", 
+                     "Dixinn", "Camayenne", "Hamdallaye", "Sonfonia", "Nongo"]
+        
+        for zone in all_zones[:10]:  # Max 10 par section
+            sections[0]["rows"].append({
+                "id": f"zone_{zone}",
+                "title": zone,
+                "description": f"Livraison disponible à {zone}"
             })
         
-        self.whatsapp.send_button_message(phone, body, buttons)
+        self.whatsapp.send_list_message(phone, body, "📍 Sélectionner", sections)
 
     def send_restaurant_list(self, phone: str, zone: str):
         """Envoie la liste des restaurants de la zone"""
@@ -427,8 +432,8 @@ class InteractiveConversationService:
             prep_time = rest.average_prep_time or 30
             sections[0]["rows"].append({
                 "id": f"rest_{rest.id}",
-                "title": rest.name[:24],  # Max 24 chars
-                "description": f"⏱️ {prep_time}min • 📍 {rest.zone}"[:72]  # Max 72 chars
+                "title": rest.name[:24],
+                "description": f"⏱️ {prep_time}min • 📍 {rest.zone}"[:72]
             })
         
         body = f"🍽️ Choisissez un restaurant à {zone}:"
@@ -442,39 +447,49 @@ class InteractiveConversationService:
             Product.available == True
         ).all()
         
+        logging.info(f"📦 Found {len(products)} products for restaurant {restaurant_id} ({restaurant.name if restaurant else 'Unknown'})")
+        
         if not products:
-            self.whatsapp.send_message(phone, "😔 Pas de produits disponibles")
+            self.whatsapp.send_message(phone, f"😔 Pas de produits disponibles pour {restaurant.name}")
             return
         
         sections = []
         
-        # Grouper par catégorie
-        categories = {}
-        for prod in products:
-            cat = prod.category or "Autres"
-            if cat not in categories:
-                categories[cat] = []
-            categories[cat].append(prod)
+        # Section principale avec tous les produits (quantité 1)
+        main_section = {
+            "title": "Menu disponible",
+            "rows": []
+        }
         
-        for cat, prods in categories.items():
-            section_rows = []
-            for prod in prods[:5]:  # Max 5 par section
-                # Créer plusieurs options de quantité pour chaque produit
-                for qty in [1, 2, 3]:
-                    section_rows.append({
+        for prod in products[:10]:
+            main_section["rows"].append({
+                "id": f"prod_{prod.id}_1",
+                "title": prod.name[:24],
+                "description": f"{int(prod.price):,} GNF"
+            })
+        
+        sections.append(main_section)
+        
+        # Section quantités multiples pour les premiers produits
+        if len(products) > 0:
+            qty_section = {
+                "title": "Quantités multiples",
+                "rows": []
+            }
+            
+            for prod in products[:3]:  # Top 3 produits
+                for qty in [2, 3]:
+                    qty_section["rows"].append({
                         "id": f"prod_{prod.id}_{qty}",
-                        "title": f"{qty}x {prod.name[:20]}",
+                        "title": f"{qty}x {prod.name[:18]}",
                         "description": f"{int(prod.price * qty):,} GNF"
                     })
             
-            if section_rows:
-                sections.append({
-                    "title": cat,
-                    "rows": section_rows[:10]  # Max 10 rows par section
-                })
+            if qty_section["rows"]:
+                sections.append(qty_section)
         
         body = f"📋 Menu de {restaurant.name}\n\nSélectionnez vos plats:"
-        self.whatsapp.send_list_message(phone, body, "🍽️ Voir le menu", sections[:5])
+        self.whatsapp.send_list_message(phone, body, "🍽️ Voir le menu", sections)
 
     def send_cart_summary(self, phone: str, context: Dict):
         """Envoie le récapitulatif du panier avec boutons d'action"""
@@ -609,13 +624,19 @@ class InteractiveConversationService:
             # Notifier le restaurant
             self.notify_restaurant(order)
             
-            # Message de confirmation
+            # Message de confirmation avec emoji de paiement
+            payment_emoji = {
+                "cash": "💵",
+                "orange_money": "📱 Orange Money",
+                "mtn_momo": "📱 MTN MoMo"
+            }.get(payment_method, "💳")
+            
             confirmation = (
                 f"🎉 *Commande #{order.id} confirmée!*\n\n"
                 f"🍽️ {context.get('selected_restaurant', {}).get('name')}\n"
                 f"📍 {delivery_address}\n"
                 f"💰 Total: {int(total_amount):,} GNF\n"
-                f"💳 Paiement: {payment_method}\n"
+                f"💳 Paiement: {payment_emoji}\n"
                 f"⏱️ Livraison: ~45 min\n\n"
                 f"Merci pour votre commande!"
             )
@@ -623,19 +644,19 @@ class InteractiveConversationService:
             self.whatsapp.send_message(phone, confirmation)
             
             # Réinitialiser le contexte
-            context.clear()
-            context["state"] = "new"
-            self.update_conversation_context(phone, context)
+            new_context = {"state": "new", "current_order": []}
+            self.update_conversation_context(phone, new_context)
             
         except Exception as e:
             logging.error(f"Order error: {e}")
-            self.whatsapp.send_message(phone, "❌ Erreur lors de la commande")
+            self.whatsapp.send_message(phone, "❌ Erreur lors de la commande. Veuillez réessayer.")
 
     def notify_restaurant(self, order: Order):
         """Notifie le restaurant de la nouvelle commande"""
         try:
             restaurant = order.restaurant
             if not restaurant or not restaurant.phone_number:
+                logging.error(f"No restaurant phone for order {order.id}")
                 return
             
             items = json.loads(order.items)
@@ -650,6 +671,7 @@ class InteractiveConversationService:
                 f"💳 Paiement: {order.payment_method}"
             )
             
+            logging.info(f"📤 Sending notification to restaurant: {restaurant.phone_number}")
             self.whatsapp.send_message(restaurant.phone_number, message)
             
         except Exception as e:
@@ -798,17 +820,29 @@ async def init_sample_data():
             mizo = db.query(Restaurant).filter(Restaurant.name == "Chez Mizo").first()
             if mizo:
                 products = [
-                    Product(restaurant_id=mizo.id, name="Riz sauce", price=15000, category="Plats", description="Riz sauce arachide"),
-                    Product(restaurant_id=mizo.id, name="Riz gras", price=12000, category="Plats", description="Riz au gras"),
-                    Product(restaurant_id=mizo.id, name="Poulet", price=25000, category="Plats", description="Poulet braisé"),
-                    Product(restaurant_id=mizo.id, name="Poisson", price=20000, category="Plats", description="Poisson grillé"),
-                    Product(restaurant_id=mizo.id, name="Coca", price=3000, category="Boissons", description="Coca-Cola"),
-                    Product(restaurant_id=mizo.id, name="Eau", price=2000, category="Boissons", description="Eau minérale"),
+                    Product(restaurant_id=mizo.id, name="Riz sauce arachide", price=15000, category="Plats", description="Riz blanc avec sauce", available=True),
+                    Product(restaurant_id=mizo.id, name="Riz gras", price=12000, category="Plats", description="Riz au gras", available=True),
+                    Product(restaurant_id=mizo.id, name="Poulet braisé", price=25000, category="Plats", description="Poulet grillé", available=True),
+                    Product(restaurant_id=mizo.id, name="Poisson grillé", price=20000, category="Plats", description="Poisson frais", available=True),
+                    Product(restaurant_id=mizo.id, name="Coca-Cola", price=3000, category="Boissons", description="33cl", available=True),
+                    Product(restaurant_id=mizo.id, name="Eau minérale", price=2000, category="Boissons", description="50cl", available=True),
                 ]
                 for product in products:
                     db.add(product)
+                db.commit()
             
-            db.commit()
+            # Produits pour Restaurant Barita
+            barita = db.query(Restaurant).filter(Restaurant.name == "Restaurant Barita").first()
+            if barita:
+                products_barita = [
+                    Product(restaurant_id=barita.id, name="Atiéké poisson", price=20000, category="Plats", available=True),
+                    Product(restaurant_id=barita.id, name="Poulet yassa", price=22000, category="Plats", available=True),
+                    Product(restaurant_id=barita.id, name="Frites", price=8000, category="Accompagnements", available=True),
+                    Product(restaurant_id=barita.id, name="Jus d'ananas", price=5000, category="Boissons", available=True),
+                ]
+                for product in products_barita:
+                    db.add(product)
+                db.commit()
         
         logging.info("✅ Sample data initialized")
         
@@ -822,6 +856,24 @@ async def init_sample_data():
 async def startup_event():
     await init_sample_data()
     logging.info("🚀 Conakry Food Interactive started")
+
+# Test endpoint pour vérifier l'envoi WhatsApp
+@app.get("/test-whatsapp")
+async def test_whatsapp():
+    wa = WhatsAppService()
+    test_number = "33755347855"  # Numéro de Mizo
+    
+    logging.info(f"Testing with token: {config.WHATSAPP_TOKEN[:20] if config.WHATSAPP_TOKEN else 'NOT SET'}...")
+    logging.info(f"Testing with phone_id: {config.WHATSAPP_PHONE_ID}")
+    
+    success = wa.send_message(test_number, "Test depuis Conakry Food - Version Interactive!")
+    
+    return {
+        "success": success,
+        "phone": test_number,
+        "token_configured": bool(config.WHATSAPP_TOKEN != "your_whatsapp_token"),
+        "phone_id_configured": bool(config.WHATSAPP_PHONE_ID != "your_phone_id")
+    }
 
 logging.basicConfig(
     level=logging.INFO,
