@@ -1,18 +1,20 @@
 # main.py - Version Interactive Complète avec GPS et Paiements
 # Système de commande restaurant avec géolocalisation et Mobile Money
-# WhatsApp Business API + GPS + Orange Money/MTN MoMo
+# WhatsApp Business API + GPS + Orange Money/MTN MoMo + Enregistrement Restaurants + Gestion Menus
 
 import os
 import re
 import json
 import logging
 import unicodedata
-from datetime import datetime
+import secrets
+import hashlib
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from math import radians, cos, sin, asin, sqrt
 
-from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Depends, Request, Form
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, Text, ForeignKey, Boolean
@@ -187,6 +189,105 @@ def get_db():
         db.close()
 
 # -----------------------------------------------------------------------------
+# Service d'authentification Restaurant
+# -----------------------------------------------------------------------------
+class RestaurantAuth:
+    def __init__(self, db: Session):
+        self.db = db
+    
+    def generate_login_link(self, restaurant_phone: str) -> str:
+        """Génère un lien de connexion sécurisé"""
+        token = secrets.token_urlsafe(32)
+        
+        login_token = {
+            "phone": restaurant_phone,
+            "token": token,
+            "expires_at": (datetime.utcnow() + timedelta(hours=24)).isoformat(),
+            "used": False
+        }
+        
+        self.save_login_token(login_token)
+        return f"http://localhost:8000/restaurant/login/{token}"
+    
+    def save_login_token(self, token_data: Dict):
+        """Sauvegarde les tokens de connexion"""
+        filename = "restaurant_tokens.json"
+        
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
+                tokens = json.load(f)
+        else:
+            tokens = []
+        
+        tokens.append(token_data)
+        
+        # Nettoyer les tokens expirés
+        now = datetime.utcnow().isoformat()
+        tokens = [t for t in tokens if t.get("expires_at", "") > now]
+        
+        with open(filename, 'w') as f:
+            json.dump(tokens, f, indent=2)
+    
+    def verify_token(self, token: str) -> Optional[str]:
+        """Vérifie un token de connexion"""
+        try:
+            with open("restaurant_tokens.json", 'r') as f:
+                tokens = json.load(f)
+            
+            now = datetime.utcnow().isoformat()
+            
+            for token_data in tokens:
+                if (token_data.get("token") == token and 
+                    not token_data.get("used") and
+                    token_data.get("expires_at", "") > now):
+                    
+                    token_data["used"] = True
+                    
+                    with open("restaurant_tokens.json", 'w') as f:
+                        json.dump(tokens, f, indent=2)
+                    
+                    return token_data.get("phone")
+            
+            return None
+            
+        except FileNotFoundError:
+            return None
+
+# -----------------------------------------------------------------------------
+# Fonctions utilitaires pour l'enregistrement
+# -----------------------------------------------------------------------------
+def save_registration_data(data: Dict):
+    """Sauvegarde les données d'enregistrement"""
+    filename = "pending_registrations.json"
+    
+    if os.path.exists(filename):
+        with open(filename, 'r', encoding='utf-8') as f:
+            registrations = json.load(f)
+    else:
+        registrations = []
+    
+    registrations.append(data)
+    
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(registrations, f, indent=2, ensure_ascii=False)
+
+def get_zone_coordinates(zone: str) -> Dict:
+    """Retourne les coordonnées d'une zone"""
+    zone_coordinates = {
+        "Kipé": {"lat": 9.5900, "lng": -13.6100},
+        "Kaloum": {"lat": 9.5380, "lng": -13.6773},
+        "Ratoma": {"lat": 9.5800, "lng": -13.6300},
+        "Matam": {"lat": 9.5600, "lng": -13.6400},
+        "Matoto": {"lat": 9.5500, "lng": -13.6200},
+        "Dixinn": {"lat": 9.5450, "lng": -13.6850},
+        "Camayenne": {"lat": 9.5350, "lng": -13.6900},
+        "Hamdallaye": {"lat": 9.5700, "lng": -13.6250},
+        "Sonfonia": {"lat": 9.5950, "lng": -13.5900},
+        "Nongo": {"lat": 9.6000, "lng": -13.5800}
+    }
+    return zone_coordinates.get(zone, {"lat": 9.5091, "lng": -13.7122})
+
+# -----------------------------------------------------------------------------
 # Service de géolocalisation
 # -----------------------------------------------------------------------------
 class GeolocationService:
@@ -221,39 +322,7 @@ class GeolocationService:
     
     async def geocode_address(self, address: str, zone: str) -> Dict:
         """Convertit une adresse en coordonnées GPS via Google Maps API"""
-        # Pour les tests, utiliser des coordonnées par défaut selon la zone
-        zone_coordinates = {
-            "Kipé": {"lat": 9.5900, "lng": -13.6100},
-            "Kaloum": {"lat": 9.5380, "lng": -13.6773},
-            "Ratoma": {"lat": 9.5800, "lng": -13.6300},
-            "Matam": {"lat": 9.5600, "lng": -13.6400},
-            "Matoto": {"lat": 9.5500, "lng": -13.6200},
-            "Dixinn": {"lat": 9.5450, "lng": -13.6850},
-            "Camayenne": {"lat": 9.5350, "lng": -13.6900},
-            "Hamdallaye": {"lat": 9.5700, "lng": -13.6250},
-            "Sonfonia": {"lat": 9.5950, "lng": -13.5900},
-            "Nongo": {"lat": 9.6000, "lng": -13.5800}
-        }
-        
-        # Si on a une vraie clé Google Maps, faire l'appel API
-        if self.google_api_key and self.google_api_key != "your_google_maps_key":
-            try:
-                url = "https://maps.googleapis.com/maps/api/geocode/json"
-                params = {
-                    "address": f"{address}, {zone}, Conakry, Guinea",
-                    "key": self.google_api_key
-                }
-                response = requests.get(url, params=params)
-                data = response.json()
-                
-                if data["status"] == "OK" and data["results"]:
-                    location = data["results"][0]["geometry"]["location"]
-                    return {"lat": location["lat"], "lng": location["lng"]}
-            except Exception as e:
-                logging.error(f"Geocoding error: {e}")
-        
-        # Fallback: utiliser les coordonnées de la zone
-        return zone_coordinates.get(zone, {"lat": 9.5091, "lng": -13.7122})  # Centre Conakry
+        return get_zone_coordinates(zone)
 
 # -----------------------------------------------------------------------------
 # Services de paiement Mobile Money
@@ -446,6 +515,20 @@ class InteractiveConversationService:
     def handle_text_message(self, phone: str, message: str):
         """Gère les messages texte normaux"""
         context = self.get_conversation_context(phone)
+        
+        # Vérifier si c'est une demande d'enregistrement restaurant
+        registration_keywords = [
+            "enregistrer restaurant", "devenir partenaire", 
+            "rejoindre plateforme", "inscription restaurant",
+            "partenariat", "livraison restaurant"
+        ]
+        
+        if any(keyword in message.lower() for keyword in registration_keywords):
+            self.whatsapp.send_message(phone, 
+                "🍽️ Pour enregistrer votre restaurant, rendez-vous sur:\n\n"
+                "http://localhost:8000/register-restaurant\n\n"
+                "Vous pourrez remplir le formulaire et nous examinerons votre demande dans les 24-48h.")
+            return
         
         # Si on attend une adresse
         if context.get("state") == "waiting_address":
@@ -667,7 +750,7 @@ class InteractiveConversationService:
         self.whatsapp.send_list_message(phone, body, "📋 Voir", sections)
 
     def send_product_list(self, phone: str, restaurant_id: int):
-        """Envoie le menu du restaurant"""
+        """Envoie le menu du restaurant (utilise les vrais produits de la base)"""
         restaurant = self.db.query(Restaurant).filter(Restaurant.id == restaurant_id).first()
         products = self.db.query(Product).filter(
             Product.restaurant_id == restaurant_id,
@@ -857,7 +940,7 @@ class InteractiveConversationService:
             elif payment_method == "mtn_momo":
                 asyncio.run(self.mtn_momo.request_payment(payment_phone, int(total_amount), order.id))
             
-            # Notifier le restaurant
+            # Notifier le restaurant avec lien dashboard
             self.notify_restaurant(order)
             
             # Assigner un livreur
@@ -890,11 +973,15 @@ class InteractiveConversationService:
             self.whatsapp.send_message(phone, "❌ Erreur. Veuillez réessayer.")
 
     def notify_restaurant(self, order: Order):
-        """Notifie le restaurant avec infos de distance"""
+        """Notifie le restaurant avec lien dashboard"""
         try:
             restaurant = order.restaurant
             if not restaurant or not restaurant.phone_number:
                 return
+            
+            # Générer un lien d'accès rapide au dashboard
+            auth = RestaurantAuth(self.db)
+            dashboard_link = auth.generate_login_link(restaurant.phone_number)
             
             items = json.loads(order.items)
             items_text = "\n".join([f"• {item['quantity']}× {item['name']}" for item in items])
@@ -909,7 +996,8 @@ class InteractiveConversationService:
                 f"💰 Total: {int(order.total_amount):,} GNF\n"
                 f"⏱️ Temps estimé: {order.estimated_delivery_time} min\n\n"
                 f"*Articles:*\n{items_text}\n\n"
-                f"💳 {order.payment_method}"
+                f"💳 {order.payment_method}\n\n"
+                f"🎛️ Gérer via dashboard:\n{dashboard_link}"
             )
             
             self.whatsapp.send_message(restaurant.phone_number, message)
@@ -961,9 +1049,9 @@ class InteractiveConversationService:
             logging.error(f"Driver assignment error: {e}")
 
 # -----------------------------------------------------------------------------
-# API FastAPI
+# API FastAPI avec Routes Restaurant
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Conakry Food API", version="3.0.0")
+app = FastAPI(title="Conakry Food API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -973,12 +1061,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -----------------------------------------------------------------------------
+# Routes principales existantes
+# -----------------------------------------------------------------------------
 @app.get("/")
 async def root():
     return {
         "message": "Conakry Food API",
-        "version": "3.0.0",
-        "features": ["GPS", "Mobile Money", "Interactive UI"]
+        "version": "4.0.0",
+        "features": ["GPS", "Mobile Money", "Restaurant Registration", "Menu Management"]
     }
 
 @app.get("/health")
@@ -986,14 +1077,878 @@ async def health_check(db: Session = Depends(get_db)):
     try:
         restaurant_count = db.query(Restaurant).count()
         order_count = db.query(Order).count()
+        product_count = db.query(Product).count()
         return {
             "status": "ok",
             "restaurants": restaurant_count,
-            "orders": order_count
+            "orders": order_count,
+            "products": product_count
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
+# -----------------------------------------------------------------------------
+# Routes d'enregistrement restaurant
+# -----------------------------------------------------------------------------
+@app.get("/register-restaurant", response_class=HTMLResponse)
+async def restaurant_registration_form():
+    """Formulaire d'enregistrement restaurant"""
+    return """
+    <!DOCTYPE html>
+    <html lang="fr">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Rejoignez Conakry Food</title>
+        <style>
+            body { 
+                font-family: Arial, sans-serif; 
+                max-width: 600px; 
+                margin: 0 auto; 
+                padding: 20px;
+                background: #f5f5f5;
+            }
+            .form-container {
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            .form-group { 
+                margin-bottom: 20px; 
+            }
+            label { 
+                display: block; 
+                margin-bottom: 5px; 
+                font-weight: bold;
+                color: #333;
+            }
+            input, select, textarea { 
+                width: 100%; 
+                padding: 12px; 
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                font-size: 16px;
+            }
+            button { 
+                background: #28a745; 
+                color: white; 
+                padding: 15px 30px; 
+                border: none;
+                border-radius: 5px;
+                font-size: 18px;
+                cursor: pointer;
+                width: 100%;
+            }
+            button:hover { background: #218838; }
+            .header { text-align: center; margin-bottom: 30px; }
+            .required { color: red; }
+        </style>
+    </head>
+    <body>
+        <div class="form-container">
+            <div class="header">
+                <h1>🍽️ Rejoignez Conakry Food</h1>
+                <p>Développez votre business avec la livraison en ligne</p>
+            </div>
+            
+            <form action="/submit-restaurant" method="post">
+                <div class="form-group">
+                    <label>Nom du restaurant <span class="required">*</span></label>
+                    <input type="text" name="name" required placeholder="Ex: Chez Fatou">
+                </div>
+                
+                <div class="form-group">
+                    <label>Téléphone WhatsApp <span class="required">*</span></label>
+                    <input type="tel" name="phone" required placeholder="+224 XXX XX XX XX">
+                </div>
+                
+                <div class="form-group">
+                    <label>Adresse complète <span class="required">*</span></label>
+                    <textarea name="address" rows="3" required placeholder="Rue, quartier, repères..."></textarea>
+                </div>
+                
+                <div class="form-group">
+                    <label>Zone de Conakry <span class="required">*</span></label>
+                    <select name="zone" required>
+                        <option value="">Choisir votre zone...</option>
+                        <option value="Kipé">Kipé</option>
+                        <option value="Kaloum">Kaloum</option>
+                        <option value="Ratoma">Ratoma</option>
+                        <option value="Matam">Matam</option>
+                        <option value="Matoto">Matoto</option>
+                        <option value="Dixinn">Dixinn</option>
+                        <option value="Camayenne">Camayenne</option>
+                        <option value="Hamdallaye">Hamdallaye</option>
+                        <option value="Sonfonia">Sonfonia</option>
+                        <option value="Nongo">Nongo</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label>Type de cuisine</label>
+                    <select name="cuisine_type">
+                        <option value="">Sélectionner...</option>
+                        <option value="Guinéenne">Cuisine guinéenne</option>
+                        <option value="Africaine">Cuisine africaine</option>
+                        <option value="Libanaise">Cuisine libanaise</option>
+                        <option value="Fast-food">Fast-food</option>
+                        <option value="Mixte">Cuisine mixte</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label>Description de vos spécialités</label>
+                    <textarea name="menu_description" rows="4" placeholder="Décrivez vos plats populaires, gamme de prix..."></textarea>
+                </div>
+                
+                <button type="submit">📝 Soumettre ma demande</button>
+                
+                <p style="font-size: 14px; color: #666; margin-top: 20px; text-align: center;">
+                    Nous examinerons votre demande sous 48h et vous contacterons via WhatsApp
+                </p>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.post("/submit-restaurant", response_class=HTMLResponse)
+async def submit_restaurant_registration(
+    name: str = Form(...),
+    phone: str = Form(...),
+    address: str = Form(...),
+    zone: str = Form(...),
+    cuisine_type: str = Form(""),
+    menu_description: str = Form(""),
+    db: Session = Depends(get_db)
+):
+    """Traite la soumission d'enregistrement restaurant"""
+    try:
+        # Nettoyer le numéro de téléphone
+        phone_clean = phone.replace(" ", "").replace("-", "")
+        if not phone_clean.startswith("+224"):
+            phone_clean = "+224" + phone_clean.replace("+", "")
+        
+        # Créer la demande
+        registration_data = {
+            "name": name.strip(),
+            "phone_number": phone_clean,
+            "address": address.strip(),
+            "zone": zone,
+            "cuisine_type": cuisine_type,
+            "menu_description": menu_description.strip(),
+            "status": "pending_approval",
+            "submitted_at": datetime.utcnow().isoformat(),
+            "source": "web_form"
+        }
+        
+        # Sauvegarder dans fichier JSON
+        save_registration_data(registration_data)
+        
+        # Générer numéro de référence
+        ref_number = abs(hash(phone_clean)) % 10000
+        
+        # Notifier le restaurant via WhatsApp
+        whatsapp = WhatsAppService()
+        confirmation_message = (
+            f"✅ Demande d'enregistrement reçue!\n\n"
+            f"🏪 Restaurant: {name}\n"
+            f"📋 Référence: #{ref_number}\n\n"
+            f"Notre équipe examinera votre demande dans les 24-48h.\n"
+            f"Gardez ce numéro WhatsApp actif pour le suivi.\n\n"
+            f"Merci de votre confiance! 🙏"
+        )
+        whatsapp.send_message(phone_clean, confirmation_message)
+        
+        # Notifier l'admin
+        admin_message = (
+            f"🆕 NOUVELLE DEMANDE RESTAURANT\n\n"
+            f"🏪 {name}\n"
+            f"📞 {phone_clean}\n"
+            f"📍 {address}, {zone}\n"
+            f"🍽️ {cuisine_type}\n"
+            f"📋 Réf: #{ref_number}\n\n"
+            f"Voir: http://localhost:8000/admin/restaurants"
+        )
+        whatsapp.send_message(config.ADMIN_PHONE, admin_message)
+        
+        # Page de confirmation
+        return f"""
+        <!DOCTYPE html>
+        <html lang="fr">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Demande envoyée - Conakry Food</title>
+            <style>
+                body {{ 
+                    font-family: Arial, sans-serif; 
+                    text-align: center; 
+                    padding: 50px;
+                    background: #f8f9fa;
+                }}
+                .success-box {{
+                    background: white;
+                    padding: 40px;
+                    border-radius: 10px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                    max-width: 500px;
+                    margin: 0 auto;
+                }}
+                .success-icon {{ font-size: 60px; margin-bottom: 20px; }}
+                .ref-number {{ 
+                    background: #e7f3ff; 
+                    padding: 15px; 
+                    border-radius: 5px; 
+                    margin: 20px 0;
+                    font-weight: bold;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="success-box">
+                <div class="success-icon">🎉</div>
+                <h1>Demande envoyée avec succès!</h1>
+                <div class="ref-number">
+                    Numéro de référence: #{ref_number}
+                </div>
+                <p>Nous examinerons votre demande dans les <strong>24-48 heures</strong>.</p>
+                <p>Vous recevrez une confirmation sur WhatsApp au <strong>{phone_clean}</strong></p>
+                <hr>
+                <h3>Prochaines étapes:</h3>
+                <ul style="text-align: left;">
+                    <li>📞 Notre équipe vous contactera</li>
+                    <li>📋 Vérification des informations</li>
+                    <li>🎓 Formation sur la plateforme</li>
+                    <li>🚀 Activation de votre restaurant</li>
+                </ul>
+                <p style="margin-top: 30px;">
+                    <a href="/register-restaurant" style="color: #007bff;">Soumettre une autre demande</a>
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+        
+    except Exception as e:
+        logging.error(f"Registration submission error: {e}")
+        return """
+        <html><body style="text-align: center; padding: 50px;">
+            <h1>❌ Erreur</h1>
+            <p>Une erreur s'est produite. Veuillez réessayer.</p>
+            <a href="/register-restaurant">← Retour au formulaire</a>
+        </body></html>
+        """
+
+# -----------------------------------------------------------------------------
+# Dashboard admin pour approuver les restaurants
+# -----------------------------------------------------------------------------
+@app.get("/admin/restaurants", response_class=HTMLResponse)
+async def admin_restaurant_dashboard():
+    """Dashboard admin pour gérer les demandes"""
+    try:
+        with open("pending_registrations.json", 'r', encoding='utf-8') as f:
+            registrations = json.load(f)
+    except FileNotFoundError:
+        registrations = []
+    
+    pending = [r for r in registrations if r.get("status") == "pending_approval"]
+    approved = [r for r in registrations if r.get("status") == "approved"]
+    rejected = [r for r in registrations if r.get("status") == "rejected"]
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="fr">
+    <head>
+        <meta charset="UTF-8">
+        <title>Admin - Restaurants Conakry Food</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; }}
+            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
+            th {{ background-color: #f8f9fa; }}
+            .btn {{ padding: 5px 10px; margin: 2px; text-decoration: none; border-radius: 3px; }}
+            .btn-success {{ background: #28a745; color: white; }}
+            .btn-danger {{ background: #dc3545; color: white; }}
+            .stats {{ display: flex; gap: 20px; margin-bottom: 30px; }}
+            .stat-box {{ padding: 20px; background: #f8f9fa; border-radius: 5px; text-align: center; }}
+        </style>
+    </head>
+    <body>
+        <h1>🍽️ Administration - Restaurants</h1>
+        
+        <div class="stats">
+            <div class="stat-box">
+                <h3>⏳ En attente</h3>
+                <h2>{len(pending)}</h2>
+            </div>
+            <div class="stat-box">
+                <h3>✅ Approuvés</h3>
+                <h2>{len(approved)}</h2>
+            </div>
+            <div class="stat-box">
+                <h3>❌ Rejetés</h3>
+                <h2>{len(rejected)}</h2>
+            </div>
+        </div>
+        
+        <h2>📋 Demandes en attente</h2>
+        <table>
+            <tr>
+                <th>Restaurant</th>
+                <th>Téléphone</th>
+                <th>Zone</th>
+                <th>Cuisine</th>
+                <th>Date</th>
+                <th>Actions</th>
+            </tr>
+    """
+    
+    for reg in pending:
+        html += f"""
+        <tr>
+            <td><strong>{reg.get('name', 'N/A')}</strong><br>
+                <small>{reg.get('address', '')}</small></td>
+            <td>{reg.get('phone_number', '')}</td>
+            <td>{reg.get('zone', '')}</td>
+            <td>{reg.get('cuisine_type', 'N/A')}</td>
+            <td>{reg.get('submitted_at', '')[:10]}</td>
+            <td>
+                <a href="/admin/approve-restaurant?phone={reg.get('phone_number', '')}" 
+                   class="btn btn-success" onclick="return confirm('Approuver ce restaurant?')">✅ Approuver</a>
+                <a href="/admin/reject-restaurant?phone={reg.get('phone_number', '')}" 
+                   class="btn btn-danger" onclick="return confirm('Rejeter cette demande?')">❌ Rejeter</a>
+            </td>
+        </tr>
+        """
+    
+    if not pending:
+        html += "<tr><td colspan='6'>Aucune demande en attente</td></tr>"
+    
+    html += """
+        </table>
+        
+        <h2>✅ Restaurants approuvés récemment</h2>
+        <table>
+            <tr><th>Restaurant</th><th>Téléphone</th><th>Zone</th><th>Approuvé le</th></tr>
+    """
+    
+    for reg in approved[-5:]:  # 5 derniers approuvés
+        html += f"""
+        <tr>
+            <td>{reg.get('name', '')}</td>
+            <td>{reg.get('phone_number', '')}</td>
+            <td>{reg.get('zone', '')}</td>
+            <td>{reg.get('approved_at', '')[:10]}</td>
+        </tr>
+        """
+    
+    html += """
+        </table>
+    </body>
+    </html>
+    """
+    
+    return html
+
+@app.get("/admin/approve-restaurant")
+async def approve_restaurant_web(phone: str, db: Session = Depends(get_db)):
+    """Approuve un restaurant via interface web"""
+    try:
+        # Charger les demandes
+        with open("pending_registrations.json", 'r', encoding='utf-8') as f:
+            registrations = json.load(f)
+        
+        # Trouver et approuver
+        registration = None
+        for reg in registrations:
+            if reg.get("phone_number") == phone and reg.get("status") == "pending_approval":
+                reg["status"] = "approved"
+                reg["approved_at"] = datetime.utcnow().isoformat()
+                registration = reg
+                break
+        
+        if not registration:
+            return HTMLResponse("<h1>❌ Demande non trouvée</h1>")
+        
+        # Sauvegarder
+        with open("pending_registrations.json", 'w', encoding='utf-8') as f:
+            json.dump(registrations, f, indent=2, ensure_ascii=False)
+        
+        # Créer le restaurant en base de données
+        coords = get_zone_coordinates(registration["zone"])
+        restaurant = Restaurant(
+            name=registration["name"],
+            phone_number=phone,
+            address=registration["address"],
+            zone=registration["zone"],
+            latitude=coords["lat"],
+            longitude=coords["lng"],
+            is_active=True,
+            commission_rate=0.15,
+            average_prep_time=30
+        )
+        
+        db.add(restaurant)
+        db.commit()
+        
+        # Notifier le restaurant
+        whatsapp = WhatsAppService()
+        success_message = (
+            f"🎉 FÉLICITATIONS!\n\n"
+            f"Votre restaurant '{registration['name']}' a été approuvé et activé sur Conakry Food!\n\n"
+            f"📋 Prochaines étapes:\n"
+            f"1. Ajoutez votre menu sur: http://localhost:8000/restaurant/request-access\n"
+            f"2. Formation rapide sur la plateforme\n"
+            f"3. Début des commandes\n\n"
+            f"Bienvenue dans l'équipe Conakry Food! 🍽️"
+        )
+        whatsapp.send_message(phone, success_message)
+        
+        return HTMLResponse("""
+            <html><body style="text-align: center; padding: 50px;">
+                <h1>✅ Restaurant approuvé!</h1>
+                <p>Le restaurant a été créé en base et notifié par WhatsApp.</p>
+                <a href="/admin/restaurants">← Retour au dashboard</a>
+            </body></html>
+        """)
+        
+    except Exception as e:
+        logging.error(f"Approval error: {e}")
+        return HTMLResponse(f"<h1>❌ Erreur: {e}</h1>")
+
+# -----------------------------------------------------------------------------
+# Routes de gestion des menus restaurant
+# -----------------------------------------------------------------------------
+@app.get("/restaurant/request-access", response_class=HTMLResponse)
+async def request_restaurant_access():
+    """Page pour demander l'accès au dashboard restaurant"""
+    return """
+    <!DOCTYPE html>
+    <html lang="fr">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Accès Restaurant - Conakry Food</title>
+        <style>
+            body { 
+                font-family: Arial, sans-serif; 
+                max-width: 500px; 
+                margin: 50px auto; 
+                padding: 20px;
+                background: #f8f9fa;
+            }
+            .login-box {
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                text-align: center;
+            }
+            input { 
+                width: 100%; 
+                padding: 12px; 
+                margin: 10px 0;
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                font-size: 16px;
+            }
+            button { 
+                background: #007bff; 
+                color: white; 
+                padding: 12px 30px; 
+                border: none;
+                border-radius: 5px;
+                font-size: 16px;
+                cursor: pointer;
+                width: 100%;
+            }
+            button:hover { background: #0056b3; }
+        </style>
+    </head>
+    <body>
+        <div class="login-box">
+            <h1>🍽️ Accès Restaurant</h1>
+            <p>Gérez votre menu sur Conakry Food</p>
+            
+            <form action="/restaurant/send-login-link" method="post">
+                <input type="tel" name="phone" placeholder="Votre numéro WhatsApp (+224...)" required>
+                <button type="submit">📱 Recevoir le lien d'accès</button>
+            </form>
+            
+            <p style="font-size: 14px; color: #666; margin-top: 20px;">
+                Un lien sécurisé vous sera envoyé par WhatsApp
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.post("/restaurant/send-login-link")
+async def send_restaurant_login_link(phone: str = Form(...), db: Session = Depends(get_db)):
+    """Envoie un lien de connexion au restaurant"""
+    try:
+        phone_clean = phone.replace(" ", "").replace("-", "")
+        if not phone_clean.startswith("+224"):
+            phone_clean = "+224" + phone_clean.replace("+", "")
+        
+        restaurant = db.query(Restaurant).filter(
+            Restaurant.phone_number == phone_clean,
+            Restaurant.is_active == True
+        ).first()
+        
+        if not restaurant:
+            return HTMLResponse("""
+                <html><body style="text-align: center; padding: 50px;">
+                    <h1>❌ Restaurant non trouvé</h1>
+                    <p>Ce numéro ne correspond à aucun restaurant enregistré.</p>
+                    <a href="/restaurant/request-access">← Réessayer</a>
+                </body></html>
+            """)
+        
+        auth = RestaurantAuth(db)
+        login_link = auth.generate_login_link(phone_clean)
+        
+        whatsapp = WhatsAppService()
+        message = (
+            f"🔐 Lien d'accès à votre dashboard restaurant:\n\n"
+            f"{login_link}\n\n"
+            f"⚠️ Ce lien expire dans 24h et ne peut être utilisé qu'une fois.\n\n"
+            f"Gérez votre menu, vos commandes et vos paramètres."
+        )
+        whatsapp.send_message(phone_clean, message)
+        
+        return HTMLResponse("""
+            <html><body style="text-align: center; padding: 50px;">
+                <h1>✅ Lien envoyé!</h1>
+                <p>Vérifiez votre WhatsApp et cliquez sur le lien reçu.</p>
+                <p>Le lien expire dans 24 heures.</p>
+            </body></html>
+        """)
+        
+    except Exception as e:
+        logging.error(f"Login link error: {e}")
+        return HTMLResponse("""
+            <html><body style="text-align: center; padding: 50px;">
+                <h1>❌ Erreur</h1>
+                <p>Impossible d'envoyer le lien. Réessayez plus tard.</p>
+                <a href="/restaurant/request-access">← Réessayer</a>
+            </body></html>
+        """)
+
+@app.get("/restaurant/login/{token}")
+async def restaurant_login(token: str, db: Session = Depends(get_db)):
+    """Connexion restaurant via token"""
+    auth = RestaurantAuth(db)
+    phone = auth.verify_token(token)
+    
+    if not phone:
+        return HTMLResponse("""
+            <html><body style="text-align: center; padding: 50px;">
+                <h1>❌ Lien invalide</h1>
+                <p>Ce lien a expiré ou a déjà été utilisé.</p>
+                <a href="/restaurant/request-access">Demander un nouveau lien</a>
+            </body></html>
+        """)
+    
+    response = RedirectResponse(url=f"/restaurant/dashboard?phone={phone}")
+    response.set_cookie(key="restaurant_phone", value=phone, max_age=3600*8)
+    
+    return response
+
+@app.get("/restaurant/dashboard", response_class=HTMLResponse)
+async def restaurant_dashboard(phone: str = "", db: Session = Depends(get_db)):
+    """Dashboard principal du restaurant"""
+    
+    if not phone:
+        return RedirectResponse(url="/restaurant/request-access")
+    
+    restaurant = db.query(Restaurant).filter(
+        Restaurant.phone_number == phone,
+        Restaurant.is_active == True
+    ).first()
+    
+    if not restaurant:
+        return RedirectResponse(url="/restaurant/request-access")
+    
+    products = db.query(Product).filter(Product.restaurant_id == restaurant.id).all()
+    
+    today = datetime.utcnow().date()
+    today_orders = db.query(Order).filter(
+        Order.restaurant_id == restaurant.id,
+        Order.created_at >= today
+    ).count()
+    
+    total_orders = db.query(Order).filter(Order.restaurant_id == restaurant.id).count()
+    
+    return f"""
+    <!DOCTYPE html>
+    <html lang="fr">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Dashboard - {restaurant.name}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 0; background: #f8f9fa; }}
+            .header {{ background: #007bff; color: white; padding: 20px; text-align: center; }}
+            .container {{ max-width: 1200px; margin: 0 auto; padding: 20px; }}
+            .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }}
+            .stat-card {{ background: white; padding: 20px; border-radius: 10px; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
+            .menu-section {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
+            .product {{ display: flex; justify-content: space-between; align-items: center; padding: 15px; border-bottom: 1px solid #eee; }}
+            .product:last-child {{ border-bottom: none; }}
+            .btn {{ padding: 8px 15px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; margin: 2px; }}
+            .btn-primary {{ background: #007bff; color: white; }}
+            .btn-warning {{ background: #ffc107; color: black; }}
+            .btn-success {{ background: #28a745; color: white; }}
+            .btn-danger {{ background: #dc3545; color: white; }}
+            .add-product {{ background: #28a745; color: white; padding: 15px 25px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin-bottom: 20px; width: 100%; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🍽️ {restaurant.name}</h1>
+            <p>Dashboard Restaurant - Conakry Food</p>
+        </div>
+        
+        <div class="container">
+            <div class="stats">
+                <div class="stat-card">
+                    <h3>📊 Commandes aujourd'hui</h3>
+                    <h2>{today_orders}</h2>
+                </div>
+                <div class="stat-card">
+                    <h3>📈 Total commandes</h3>
+                    <h2>{total_orders}</h2>
+                </div>
+                <div class="stat-card">
+                    <h3>🍽️ Produits au menu</h3>
+                    <h2>{len(products)}</h2>
+                </div>
+                <div class="stat-card">
+                    <h3>⭐ Note moyenne</h3>
+                    <h2>{restaurant.rating:.1f}/5</h2>
+                </div>
+            </div>
+            
+            <div class="menu-section">
+                <h2>🍽️ Gestion du Menu</h2>
+                
+                <button class="add-product" onclick="window.location.href='/restaurant/add-product?phone={phone}'">
+                    ➕ Ajouter un nouveau produit
+                </button>
+                
+                {"<p>Aucun produit dans votre menu. Commencez par ajouter vos premiers plats!</p>" if not products else ""}
+                
+                {"".join([f'''
+                <div class="product">
+                    <div>
+                        <strong>{product.name}</strong><br>
+                        <small>{product.description or "Pas de description"}</small><br>
+                        <span style="color: #007bff; font-weight: bold;">{int(product.price):,} GNF</span>
+                        <span style="color: {'green' if product.available else 'red'}; margin-left: 10px;">
+                            {'🟢 Disponible' if product.available else '🔴 Indisponible'}
+                        </span>
+                    </div>
+                    <div>
+                        <a href="/restaurant/edit-product/{product.id}?phone={phone}" class="btn btn-warning">✏️ Modifier</a>
+                        <a href="/restaurant/toggle-product/{product.id}?phone={phone}" class="btn {'btn-danger' if product.available else 'btn-success'}">
+                            {'❌ Désactiver' if product.available else '✅ Activer'}
+                        </a>
+                    </div>
+                </div>
+                ''' for product in products])}
+            </div>
+            
+            <div style="text-align: center; margin-top: 30px;">
+                <a href="/restaurant/request-access" class="btn btn-primary">🔄 Nouveau lien d'accès</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.get("/restaurant/add-product", response_class=HTMLResponse)
+async def add_product_form(phone: str = "", db: Session = Depends(get_db)):
+    """Formulaire d'ajout de produit"""
+    
+    restaurant = db.query(Restaurant).filter(Restaurant.phone_number == phone).first()
+    if not restaurant:
+        return RedirectResponse(url="/restaurant/request-access")
+    
+    return f"""
+    <!DOCTYPE html>
+    <html lang="fr">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Ajouter un produit - {restaurant.name}</title>
+        <style>
+            body {{ 
+                font-family: Arial, sans-serif; 
+                max-width: 600px; 
+                margin: 0 auto; 
+                padding: 20px;
+                background: #f8f9fa;
+            }}
+            .form-container {{
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }}
+            .form-group {{ margin-bottom: 20px; }}
+            label {{ 
+                display: block; 
+                margin-bottom: 5px; 
+                font-weight: bold;
+            }}
+            input, select, textarea {{ 
+                width: 100%; 
+                padding: 12px; 
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                font-size: 16px;
+            }}
+            button {{ 
+                background: #28a745; 
+                color: white; 
+                padding: 15px 30px; 
+                border: none;
+                border-radius: 5px;
+                font-size: 16px;
+                cursor: pointer;
+                width: 100%;
+            }}
+            .back-link {{ 
+                display: inline-block; 
+                margin-bottom: 20px;
+                color: #007bff;
+                text-decoration: none;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="form-container">
+            <a href="/restaurant/dashboard?phone={phone}" class="back-link">← Retour au dashboard</a>
+            
+            <h1>➕ Ajouter un produit</h1>
+            <p>Restaurant: <strong>{restaurant.name}</strong></p>
+            
+            <form action="/restaurant/save-product" method="post">
+                <input type="hidden" name="phone" value="{phone}">
+                
+                <div class="form-group">
+                    <label>Nom du produit *</label>
+                    <input type="text" name="name" required placeholder="Ex: Riz sauce arachide">
+                </div>
+                
+                <div class="form-group">
+                    <label>Description</label>
+                    <textarea name="description" rows="3" placeholder="Décrivez votre plat..."></textarea>
+                </div>
+                
+                <div class="form-group">
+                    <label>Prix (en GNF) *</label>
+                    <input type="number" name="price" required min="500" step="500" placeholder="15000">
+                </div>
+                
+                <div class="form-group">
+                    <label>Catégorie</label>
+                    <select name="category">
+                        <option value="Plats">Plats principaux</option>
+                        <option value="Entrées">Entrées</option>
+                        <option value="Boissons">Boissons</option>
+                        <option value="Desserts">Desserts</option>
+                        <option value="Accompagnements">Accompagnements</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" name="available" value="true" checked>
+                        Produit disponible immédiatement
+                    </label>
+                </div>
+                
+                <button type="submit">✅ Ajouter au menu</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.post("/restaurant/save-product")
+async def save_product(
+    phone: str = Form(...),
+    name: str = Form(...),
+    description: str = Form(""),
+    price: float = Form(...),
+    category: str = Form("Plats"),
+    available: str = Form("false"),
+    db: Session = Depends(get_db)
+):
+    """Sauvegarde un nouveau produit"""
+    try:
+        restaurant = db.query(Restaurant).filter(Restaurant.phone_number == phone).first()
+        if not restaurant:
+            raise HTTPException(status_code=404, detail="Restaurant non trouvé")
+        
+        product = Product(
+            restaurant_id=restaurant.id,
+            name=name.strip(),
+            description=description.strip(),
+            price=price,
+            category=category,
+            available=(available == "true")
+        )
+        
+        db.add(product)
+        db.commit()
+        
+        # Notifier le succès
+        whatsapp = WhatsAppService()
+        whatsapp.send_message(phone, f"✅ Produit '{name}' ajouté à votre menu!")
+        
+        return RedirectResponse(url=f"/restaurant/dashboard?phone={phone}", status_code=303)
+        
+    except Exception as e:
+        logging.error(f"Save product error: {e}")
+        raise HTTPException(status_code=500, detail="Erreur lors de la sauvegarde")
+
+@app.get("/restaurant/toggle-product/{product_id}")
+async def toggle_product_availability(product_id: int, phone: str = "", db: Session = Depends(get_db)):
+    """Active/désactive un produit"""
+    try:
+        restaurant = db.query(Restaurant).filter(Restaurant.phone_number == phone).first()
+        if not restaurant:
+            raise HTTPException(status_code=404, detail="Restaurant non trouvé")
+        
+        product = db.query(Product).filter(
+            Product.id == product_id,
+            Product.restaurant_id == restaurant.id
+        ).first()
+        
+        if not product:
+            raise HTTPException(status_code=404, detail="Produit non trouvé")
+        
+        product.available = not product.available
+        db.commit()
+        
+        status = "activé" if product.available else "désactivé"
+        whatsapp = WhatsAppService()
+        whatsapp.send_message(phone, f"🔄 Produit '{product.name}' {status}")
+        
+        return RedirectResponse(url=f"/restaurant/dashboard?phone={phone}", status_code=303)
+        
+    except Exception as e:
+        logging.error(f"Toggle product error: {e}")
+        raise HTTPException(status_code=500, detail="Erreur")
+
+# -----------------------------------------------------------------------------
+# Routes webhook WhatsApp
+# -----------------------------------------------------------------------------
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     verify_token = request.query_params.get("hub.verify_token")
@@ -1093,7 +2048,7 @@ async def init_sample_data():
             restaurants = [
                 Restaurant(
                     name="Chez Fatou",
-                    phone_number="33755347855",
+                    phone_number="+224755347855",
                     address="Kipé Centre Commercial",
                     zone="Kipé",
                     latitude=9.5900,
@@ -1103,7 +2058,7 @@ async def init_sample_data():
                 ),
                 Restaurant(
                     name="Restaurant Barita",
-                    phone_number="224622334455",
+                    phone_number="+224622334455",
                     address="Kaloum, Avenue de la République",
                     zone="Kaloum",
                     latitude=9.5380,
@@ -1113,7 +2068,7 @@ async def init_sample_data():
                 ),
                 Restaurant(
                     name="Le Délice de Ratoma",
-                    phone_number="224633445566",
+                    phone_number="+224633445566",
                     address="Ratoma Centre",
                     zone="Ratoma",
                     latitude=9.5800,
@@ -1160,14 +2115,14 @@ async def init_sample_data():
             drivers = [
                 DeliveryDriver(
                     name="Mamadou Bah",
-                    phone_number="33763524511",
+                    phone_number="+224763524511",
                     zone="Kipé",
                     current_latitude=9.5900,
                     current_longitude=-13.6100
                 ),
                 DeliveryDriver(
                     name="Alpha Diallo",
-                    phone_number="224600000001",
+                    phone_number="+224600000001",
                     zone="Kaloum",
                     current_latitude=9.5380,
                     current_longitude=-13.6773
@@ -1177,7 +2132,7 @@ async def init_sample_data():
                 db.add(driver)
             db.commit()
         
-        logging.info("✅ Data initialized with GPS coordinates")
+        logging.info("✅ Data initialized with GPS coordinates and menu management")
         
     except Exception as e:
         logging.error(f"Init error: {e}")
@@ -1188,7 +2143,7 @@ async def init_sample_data():
 @app.on_event("startup")
 async def startup_event():
     await init_sample_data()
-    logging.info("🚀 Conakry Food v3.0 started with GPS & Mobile Money")
+    logging.info("🚀 Conakry Food v4.0 started with Restaurant Registration & Menu Management")
 
 logging.basicConfig(
     level=logging.INFO,
